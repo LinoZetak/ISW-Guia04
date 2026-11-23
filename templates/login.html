@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Iniciar sesión</title>
+  <title>Iniciar sesión · TaskGuard</title>
   <style>
     :root {
       --accent: #2563eb;
@@ -219,13 +219,13 @@
         <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
       </svg>
     </div>
-    AuthAPI
+    TaskGuard
   </div>
 
   <div class="card">
     <h1>{{ 'Crea tu cuenta' if tab == 'registro' else 'Bienvenido' }}</h1>
     <p class="subtitle">
-      {{ 'Regístrate para empezar a usar la plataforma.' if tab == 'registro' else 'Accede a tu cuenta para continuar.' }}
+      {{ 'Crea tu cuenta para gestionar tus tareas de forma segura.' if tab == 'registro' else 'Inicia sesión para gestionar tus tareas de forma segura.' }}
     </p>
 
     <div class="tabs" role="tablist">

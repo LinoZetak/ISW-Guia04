@@ -26,7 +26,7 @@ DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "auth.db")
 
 app = Flask(__name__)
 
-logger = logging.getLogger("authapi")
+logger = logging.getLogger("taskguard")
 if not logger.handlers:
     _handler = logging.StreamHandler()
     _handler.setFormatter(

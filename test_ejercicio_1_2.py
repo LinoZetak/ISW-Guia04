@@ -126,7 +126,7 @@ class TestCredencialesYFuerzaBruta(BaseSeguridad):
 
     def test_06_login_fallido_queda_en_log_sin_la_clave(self):
         self.registrar("ana@unsaac.edu.pe")
-        with self.assertLogs("authapi", level="WARNING") as logs:
+        with self.assertLogs("taskguard", level="WARNING") as logs:
             self.login("ana@unsaac.edu.pe", "ClaveSecretaXYZ1")
         salida = "\n".join(logs.output)
         self.assertIn("Login fallido", salida)
@@ -272,7 +272,7 @@ class TestRecuperacion(BaseSeguridad):
 
     def test_19_evento_registrado_sin_exponer_el_token(self):
         self.registrar("ana@unsaac.edu.pe")
-        with self.assertLogs("authapi", level="INFO") as logs:
+        with self.assertLogs("taskguard", level="INFO") as logs:
             tok = self._pedir_token("ana@unsaac.edu.pe")
         salida = "\n".join(logs.output)
         self.assertIn("recuperacion_solicitada", salida)
