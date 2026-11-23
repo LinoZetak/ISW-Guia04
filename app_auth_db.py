@@ -1,13 +1,19 @@
+import hashlib
 import logging
 import os
 import re
 import secrets
 import sqlite3
+import sys
 import threading
+import time
+from datetime import timedelta
 
 import bcrypt
 from flask import (
     Flask,
+    abort,
+    g,
     jsonify,
     redirect,
     render_template,
@@ -47,9 +53,96 @@ def _load_secret_key():
 
 app.secret_key = _load_secret_key()
 
-lock = threading.Lock()
-failed_attempts = {}
-MAX_FAILED = 5
+# --- Parametros de seguridad de sesion y autenticacion (Ejercicio 1.2) ---
+SESSION_TTL = 30 * 60          # la sesion web expira a los 30 min
+TOKEN_TTL = 30 * 60            # el token Bearer expira a los 30 min
+RESET_TTL = 15 * 60            # el token de recuperacion expira a los 15 min
+MAX_FAILED = 5                 # fallos antes de bloquear
+BLOQUEO_BASE = 60              # primer bloqueo: 60 s, luego 120, 240... (progresivo)
+BLOQUEO_MAX = 60 * 60          # tope del bloqueo: 1 hora
+VENTANA_FALLOS = 15 * 60       # fallos mas antiguos que esto se olvidan
+
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=os.environ.get("SESSION_COOKIE_SECURE") == "1",
+    PERMANENT_SESSION_LIFETIME=timedelta(seconds=SESSION_TTL),
+)
+
+# --- Roles del sistema ---
+ROL_ADMIN, ROL_DOCENTE, ROL_ESTUDIANTE = 1, 2, 3
+ROLES = {ROL_ADMIN: "Administrador", ROL_DOCENTE: "Docente", ROL_ESTUDIANTE: "Estudiante"}
+ROLES_POR_NOMBRE = {v.lower(): k for k, v in ROLES.items()}
+
+_RE_MAIL = re.compile(r"^[^@\s]{1,64}@[^@\s]+\.[A-Za-z]{2,}$")
+
+
+def _ahora():
+    """Reloj del sistema (aislado para poder simular el paso del tiempo en pruebas)."""
+    return time.time()
+
+
+def _hash_token(token):
+    """Los tokens se guardan como SHA-256: si roban la BD, no sirven."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _enmascarar(mail):
+    """Para logs: 'juan@unsaac.edu.pe' -> 'ju***@unsaac.edu.pe'."""
+    mail = str(mail or "")
+    if "@" not in mail:
+        return mail[:2] + "***"
+    usuario, dominio = mail.split("@", 1)
+    return usuario[:2] + "***@" + dominio[:40]
+
+
+class LimitadorIntentos:
+    """Cuenta fallos por clave (IP o cuenta) y aplica bloqueo temporal progresivo."""
+
+    def __init__(self):
+        self._datos = {}
+        self._lock = threading.Lock()
+
+    def segundos_bloqueo(self, clave):
+        with self._lock:
+            e = self._datos.get(clave)
+            if e and e["hasta"] > _ahora():
+                return int(e["hasta"] - _ahora()) + 1
+            return 0
+
+    def registrar_fallo(self, clave):
+        """Devuelve la duracion del bloqueo si este fallo lo activa, si no 0."""
+        with self._lock:
+            ahora = _ahora()
+            e = self._datos.setdefault(
+                clave, {"fallos": 0, "nivel": 0, "hasta": 0, "ultimo": 0}
+            )
+            if ahora - e["ultimo"] > VENTANA_FALLOS:
+                e["fallos"] = 0
+            e["ultimo"] = ahora
+            e["fallos"] += 1
+            if e["fallos"] >= MAX_FAILED:
+                duracion = min(BLOQUEO_BASE * (2 ** e["nivel"]), BLOQUEO_MAX)
+                e["hasta"] = ahora + duracion
+                e["nivel"] += 1
+                e["fallos"] = 0
+                return duracion
+            return 0
+
+    def limpiar(self, clave):
+        with self._lock:
+            self._datos.pop(clave, None)
+
+    def reiniciar(self):
+        with self._lock:
+            self._datos.clear()
+
+
+limite_ip = LimitadorIntentos()
+limite_cuenta = LimitadorIntentos()
+
+# Servicio de correo simulado: en produccion se reemplaza por SMTP.
+BUZON_SIMULADO = []
 
 
 def _es_formulario():
@@ -124,15 +217,174 @@ def init_db():
             cur.execute("ALTER TABLE Tarea ADD COLUMN nombres TEXT NOT NULL DEFAULT ''")
         conn.commit()
 
-        cur.execute("SELECT COUNT(*) FROM Rol")
-        if cur.fetchone()[0] == 0:
-            cur.executemany(
-                "INSERT INTO Rol (id, nombre) VALUES (?, ?)",
-                [(1, "Administrador"), (2, "Propietario"), (3, "User")],
+        # Roles de la guia: Administrador, Docente, Estudiante.
+        # (Migra los nombres antiguos Propietario/User conservando los ids.)
+        for rol_id, nombre in ROLES.items():
+            cur.execute("INSERT OR IGNORE INTO Rol (id, nombre) VALUES (?, ?)", (rol_id, nombre))
+            cur.execute("UPDATE Rol SET nombre = ? WHERE id = ?", (nombre, rol_id))
+        conn.commit()
+
+        # version_sesion: al cambiar la clave se incrementa e invalida toda sesion previa.
+        cur.execute("PRAGMA table_info(Usuario)")
+        if "version_sesion" not in [r[1] for r in cur.fetchall()]:
+            cur.execute(
+                "ALTER TABLE Usuario ADD COLUMN version_sesion INTEGER NOT NULL DEFAULT 0"
             )
-            conn.commit()
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS TokenSesion (
+                id INTEGER PRIMARY KEY,
+                token_hash TEXT NOT NULL UNIQUE,
+                usuario_id INTEGER NOT NULL,
+                expira_en REAL NOT NULL,
+                revocado INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY (usuario_id) REFERENCES Usuario(id)
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS TokenRecuperacion (
+                id INTEGER PRIMARY KEY,
+                token_hash TEXT NOT NULL UNIQUE,
+                usuario_id INTEGER NOT NULL,
+                expira_en REAL NOT NULL,
+                usado INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY (usuario_id) REFERENCES Usuario(id)
+            )
+            """
+        )
+        conn.commit()
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Identidad del usuario actual (sesion web o token Bearer)
+# ---------------------------------------------------------------------------
+
+def _usuario_por_id(usuario_id):
+    conn = get_db()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT u.id, u.mail, u.clave, u.rol_id, u.version_sesion, r.nombre AS rol
+            FROM Usuario u JOIN Rol r ON u.rol_id = r.id
+            WHERE u.id = ?
+            """,
+            (usuario_id,),
+        )
+        return cur.fetchone()
+    finally:
+        conn.close()
+
+
+def _usuario_actual():
+    """Devuelve el usuario autenticado o None.
+
+    - Con cabecera Bearer: el token debe existir, no estar revocado ni expirado.
+    - Con sesion web: la sesion no debe estar expirada y su version debe coincidir
+      con la del usuario (si cambio la clave, la sesion queda revocada).
+    """
+    if "usuario" in g:
+        return g.usuario
+    g.usuario = None
+
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        token = auth[7:].strip()
+        if token:
+            conn = get_db()
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT usuario_id, expira_en, revocado FROM TokenSesion WHERE token_hash = ?",
+                    (_hash_token(token),),
+                )
+                fila = cur.fetchone()
+            finally:
+                conn.close()
+            if fila and not fila["revocado"] and fila["expira_en"] > _ahora():
+                g.usuario = _usuario_por_id(fila["usuario_id"])
+            else:
+                _fallo("token_invalido", "authorization", "")
+        return g.usuario
+
+    uid = session.get("user_id")
+    if uid:
+        usuario = _usuario_por_id(uid)
+        vigente = _ahora() - session.get("login_at", 0) < SESSION_TTL
+        if usuario and vigente and session.get("ver") == usuario["version_sesion"]:
+            g.usuario = usuario
+        else:
+            session.clear()
+    return g.usuario
+
+
+def _iniciar_sesion(usuario):
+    """Regenera la sesion tras autenticarse (evita fijacion de sesion)."""
+    session.clear()
+    session.permanent = True
+    session["user_id"] = usuario["id"]
+    session["mail"] = usuario["mail"]
+    session["rol"] = usuario["rol"]
+    session["ver"] = usuario["version_sesion"]
+    session["login_at"] = _ahora()
+
+
+def _emitir_token(usuario_id):
+    token = secrets.token_urlsafe(32)
+    conn = get_db()
+    try:
+        conn.execute(
+            "INSERT INTO TokenSesion (token_hash, usuario_id, expira_en) VALUES (?, ?, ?)",
+            (_hash_token(token), usuario_id, _ahora() + TOKEN_TTL),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return token
+
+
+def _revocar_todo(conn, usuario_id):
+    """Revoca todos los tokens y sesiones web del usuario."""
+    conn.execute("UPDATE TokenSesion SET revocado = 1 WHERE usuario_id = ?", (usuario_id,))
+    conn.execute(
+        "UPDATE Usuario SET version_sesion = version_sesion + 1 WHERE id = ?",
+        (usuario_id,),
+    )
+
+
+def _validar_clave_nueva(clave):
+    if not isinstance(clave, str) or len(clave) < 8:
+        return "La clave debe tener al menos 8 caracteres"
+    if len(clave.encode("utf-8")) > 72:
+        return "La clave no puede superar los 72 bytes"
+    if not re.search(r"[A-Za-z]", clave) or not re.search(r"\d", clave):
+        return "La clave debe incluir letras y numeros"
+    return None
+
+
+def _leer_json_estricto(permitidos):
+    """Lee el cuerpo (JSON o formulario) y rechaza campos no esperados."""
+    if _es_formulario():
+        data = request.form.to_dict()
+    else:
+        data = request.get_json(silent=True)
+        if data is None:
+            data = {}
+        if not isinstance(data, dict):
+            return None, "Cuerpo de peticion invalido"
+    extra = set(data) - set(permitidos)
+    if extra:
+        campo = sorted(extra)[0][:40]
+        return None, _fallo("campo_desconocido", campo, "Campo no permitido: " + campo)
+    for k in permitidos:
+        if data.get(k) is not None and not isinstance(data[k], str):
+            return None, _fallo("tipo_dato", k, "Tipo de dato invalido para: " + k)
+    return data, None
 
 
 ESTADOS = [
@@ -145,27 +397,15 @@ ESTADOS_VALORES = [v for v, _ in ESTADOS]
 
 @app.route("/")
 def index():
-    if session.get("mail"):
+    if _usuario_actual():
         return redirect(url_for("dashboard"))
     return render_template("login.html")
 
 
 def _owner_id():
-    """Devuelve el id del usuario en sesion (lo resuelve y cachea si falta)."""
-    uid = session.get("user_id")
-    if uid:
-        return uid
-    conn = get_db()
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT id FROM Usuario WHERE mail = ?", (session["mail"],))
-        row = cur.fetchone()
-        if row:
-            session["user_id"] = row["id"]
-            return row["id"]
-    finally:
-        conn.close()
-    return None
+    """Id del usuario autenticado (sesion o token), o None."""
+    usuario = _usuario_actual()
+    return usuario["id"] if usuario else None
 
 
 CAMPOS_TAREA = ("titulo", "descripcion", "estado", "dni", "nombres")
@@ -392,37 +632,21 @@ CAMPOS_API_TASK = ("title", "description", "status")
 MAX_TASK_REQUEST_BYTES = 16 * 1024  # 16 KB
 
 
-def _tiene_sesion_o_token():
-    """Verifica sesion activa o token Bearer no vacio."""
-    if session.get("mail") or session.get("user_id"):
-        return True
-    auth_header = request.headers.get("Authorization", "")
-    if auth_header.startswith("Bearer ") and auth_header[7:].strip():
-        return True
-    return False
+def _demo_insegura_habilitada():
+    """El endpoint inseguro solo existe en pruebas o si se habilita a proposito."""
+    return app.config.get("TESTING") or os.environ.get("HABILITAR_DEMO_INSEGURA") == "1"
 
-
-def _resolver_owner_api():
-    uid = session.get("user_id")
-    if uid:
-        return uid
-    conn = get_db()
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT id FROM Usuario ORDER BY id ASC LIMIT 1")
-        row = cur.fetchone()
-        return row["id"] if row else 1
-    finally:
-        conn.close()
 
 @app.route("/tasks_insecure", methods=["POST"])
 def tasks_insecure():
-    """Version insegura: acepta cualquier dato y lo guarda sin validar."""
+    """Version insegura (solo demostracion): acepta cualquier dato sin validar."""
+    if not _demo_insegura_habilitada():
+        abort(404)
     data = request.get_json(silent=True) or request.form.to_dict()
     titulo = str(data.get("title", data.get("titulo", "")))
     descripcion = str(data.get("description", data.get("descripcion", "")))
     estado = str(data.get("status", data.get("estado", "pendiente")))
-    owner_id = data.get("owner_id", _resolver_owner_api())
+    owner_id = data.get("owner_id", _owner_id() or 1)
 
     conn = get_db()
     try:
@@ -454,7 +678,8 @@ def tasks_insecure():
 @app.route("/tasks", methods=["POST"])
 def create_task_api():
     """Endpoint seguro con validacion estricta en servidor y logging sin payload."""
-    if not _tiene_sesion_o_token():
+    usuario = _usuario_actual()
+    if not usuario:
         msg = _fallo("autenticacion", "authorization", "Token o sesion requerida")
         return jsonify({"error": msg}), 401
 
@@ -527,7 +752,7 @@ def create_task_api():
         )
         return jsonify({"error": msg}), 400
 
-    owner_id = _resolver_owner_api()
+    owner_id = usuario["id"]
     conn = get_db()
     try:
         cur = conn.cursor()
@@ -557,11 +782,12 @@ def create_task_api():
 
 
 def _contexto_dashboard(error=None, ok=None, form=None, q=""):
-    owner_id = _owner_id()
+    usuario = _usuario_actual()
+    owner_id = usuario["id"] if usuario else None
     form = form or {}
     return dict(
-        mail=session.get("mail", ""),
-        rol=session.get("rol", ""),
+        mail=usuario["mail"] if usuario else "",
+        rol=usuario["rol"] if usuario else "",
         user_id=owner_id,
         tareas=_get_tareas(owner_id, q) if owner_id else [],
         q=q,
@@ -579,7 +805,7 @@ def _contexto_dashboard(error=None, ok=None, form=None, q=""):
 
 @app.route("/dashboard")
 def dashboard():
-    if not session.get("mail"):
+    if not _usuario_actual():
         return redirect(url_for("index"))
     ctx = _contexto_dashboard(
         ok=request.args.get("ok"),
@@ -588,18 +814,43 @@ def dashboard():
     return render_template("dashboard.html", **ctx)
 
 
-@app.route("/tareas", methods=["POST"])
-def crear_tarea():
-    if not session.get("mail"):
-        if _es_formulario():
-            return redirect(url_for("index"))
+@app.route("/tareas", methods=["GET"])
+def listar_tareas():
+    """Lista las tareas del usuario. Docente/Administrador pueden pedir ?todas=1."""
+    usuario = _usuario_actual()
+    if not usuario:
         return jsonify({"error": "Sesion requerida"}), 401
 
+    q = request.args.get("q", "").strip()[:80]
+    if request.args.get("todas") == "1":
+        if usuario["rol_id"] not in (ROL_ADMIN, ROL_DOCENTE):
+            _fallo("autorizacion", "todas", "")
+            return jsonify({"error": "No tienes permiso para ver todas las tareas"}), 403
+        conn = get_db()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT id, titulo, descripcion, estado, owner_id, creado_en
+                FROM Tarea ORDER BY id DESC
+                """
+            )
+            filas = cur.fetchall()
+        finally:
+            conn.close()
+    else:
+        filas = _get_tareas(usuario["id"], q)
+
+    return jsonify({"tareas": [dict(f) for f in filas]}), 200
+
+
+@app.route("/tareas", methods=["POST"])
+def crear_tarea():
     owner_id = _owner_id()
     if not owner_id:
         if _es_formulario():
             return redirect(url_for("index"))
-        return jsonify({"error": "Sesion invalida"}), 401
+        return jsonify({"error": "Sesion requerida"}), 401
 
     datos, error = _leer_campos_tarea()
     if error:
@@ -660,10 +911,9 @@ def crear_tarea():
 @app.route("/tareas/<int:tarea_id>/actualizar", methods=["POST"])
 def actualizar_tarea(tarea_id):
     """Actualiza titulo/descripcion/estado solo si la tarea pertenece al usuario."""
-    if not session.get("mail") or not _owner_id():
-        return _no_sesion_tarea()
-
     owner_id = _owner_id()
+    if not owner_id:
+        return _no_sesion_tarea()
 
     datos, error = _leer_campos_actualizacion()
     if error:
@@ -685,8 +935,11 @@ def actualizar_tarea(tarea_id):
             (tarea_id, owner_id),
         )
         if cur.fetchone() is None:
+            _fallo("autorizacion", "tarea_id", "")
             return _respuesta_tarea("No tienes permiso sobre esta tarea", 403)
 
+        # 'asignaciones' solo contiene nombres de la lista blanca CAMPOS_ACTUALIZACION;
+        # los valores van parametrizados.
         cur.execute(
             "UPDATE Tarea SET " + asignaciones + " WHERE id = ? AND owner_id = ?",
             tuple(valores) + (tarea_id, owner_id),
@@ -694,6 +947,8 @@ def actualizar_tarea(tarea_id):
         conn.commit()
     finally:
         conn.close()
+
+    logger.info("Auditoria: tarea_actualizada tarea_id=%s usuario_id=%s", tarea_id, owner_id)
 
     if _es_formulario():
         return redirect(url_for("dashboard", ok="actualizada"))
@@ -712,25 +967,37 @@ def actualizar_tarea(tarea_id):
 @app.route("/tareas/<int:tarea_id>", methods=["DELETE"])
 @app.route("/tareas/<int:tarea_id>/eliminar", methods=["POST"])
 def eliminar_tarea(tarea_id):
-    """Elimina solo la tarea del usuario autenticado."""
-    if not session.get("mail") or not _owner_id():
+    """Elimina la tarea si es del usuario; el Administrador puede eliminar cualquiera."""
+    usuario = _usuario_actual()
+    if not usuario:
         return _no_sesion_tarea()
 
-    owner_id = _owner_id()
+    owner_id = usuario["id"]
+    es_admin = usuario["rol_id"] == ROL_ADMIN
 
     conn = get_db()
     try:
         cur = conn.cursor()
-        cur.execute(
-            "DELETE FROM Tarea WHERE id = ? AND owner_id = ?",
-            (tarea_id, owner_id),
-        )
+        if es_admin:
+            cur.execute("DELETE FROM Tarea WHERE id = ?", (tarea_id,))
+        else:
+            cur.execute(
+                "DELETE FROM Tarea WHERE id = ? AND owner_id = ?",
+                (tarea_id, owner_id),
+            )
         conn.commit()
         if cur.rowcount == 0:
+            if es_admin:
+                return _respuesta_tarea("La tarea no existe", 404)
+            _fallo("autorizacion", "tarea_id", "")
             return _respuesta_tarea("No tienes permiso sobre esta tarea", 403)
     finally:
         conn.close()
 
+    logger.info(
+        "Auditoria: tarea_eliminada tarea_id=%s usuario_id=%s rol=%s",
+        tarea_id, owner_id, usuario["rol"],
+    )
     if _es_formulario():
         return redirect(url_for("dashboard", ok="eliminada"))
     return jsonify({"id": tarea_id, "eliminada": True}), 200
@@ -742,34 +1009,64 @@ def logout():
     return redirect(url_for("index"))
 
 
+@app.route("/api/logout", methods=["POST"])
+def api_logout():
+    """Cierra la sesion web y revoca el token Bearer enviado (si lo hay)."""
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer ") and auth[7:].strip():
+        conn = get_db()
+        try:
+            conn.execute(
+                "UPDATE TokenSesion SET revocado = 1 WHERE token_hash = ?",
+                (_hash_token(auth[7:].strip()),),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    session.clear()
+    return jsonify({"mensaje": "Sesion cerrada"}), 200
+
+
+# ---------------------------------------------------------------------------
+# Autenticacion: registro, login, cambio y recuperacion de clave (Ejercicio 1.2)
+# ---------------------------------------------------------------------------
+
+# Hash ficticio: si el correo no existe igual se ejecuta bcrypt, para que el
+# tiempo de respuesta no revele si la cuenta existe.
+_HASH_FICTICIO = bcrypt.hashpw(b"clave-ficticia-123", bcrypt.gensalt()).decode("utf-8")
+
+
 @app.route("/api/registro", methods=["POST"])
 def registro():
-    if _es_formulario():
-        mail = request.form.get("mail")
-        clave = request.form.get("clave")
-    else:
-        data = request.get_json(silent=True) or {}
-        mail = data.get("mail")
-        clave = data.get("clave")
+    data, error = _leer_json_estricto(("mail", "clave"))
+    if error:
+        return _respuesta_auth(error, 400, tab="registro")
+
+    mail = (data.get("mail") or "").strip().lower()
+    clave = data.get("clave") or ""
 
     if not mail or not clave:
         return _respuesta_auth(
             "mail y clave son requeridos", 400, tab="registro", mail_form=mail
         )
+    if len(mail) > 254 or not _RE_MAIL.fullmatch(mail):
+        return _respuesta_auth("Formato de correo invalido", 400, tab="registro", mail_form=mail)
+    error = _validar_clave_nueva(clave)
+    if error:
+        return _respuesta_auth(error, 400, tab="registro", mail_form=mail)
 
     clave_hash = bcrypt.hashpw(clave.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
 
     conn = get_db()
     try:
         cur = conn.cursor()
+        # El rol NUNCA viene del cliente: todo registro nuevo es Estudiante.
         cur.execute(
             "INSERT INTO Usuario (mail, clave, rol_id) VALUES (?, ?, ?)",
-            (mail, clave_hash, 3),
+            (mail, clave_hash, ROL_ESTUDIANTE),
         )
         conn.commit()
         user_id = cur.lastrowid
-        cur.execute("SELECT nombre FROM Rol WHERE id = 3")
-        rol_nombre = cur.fetchone()["nombre"]
     except sqlite3.IntegrityError:
         return _respuesta_auth(
             "El mail ya esta registrado", 409, tab="registro", mail_form=mail
@@ -777,84 +1074,277 @@ def registro():
     finally:
         conn.close()
 
-    session.clear()
-    session["mail"] = mail
-    session["rol"] = rol_nombre
-    session["user_id"] = user_id
+    usuario = _usuario_por_id(user_id)
+    _iniciar_sesion(usuario)
+    logger.info("Auditoria: registro usuario_id=%s", user_id)
 
     if _es_formulario():
         return redirect(url_for("dashboard"))
+    return jsonify({"rol": usuario["rol"]}), 201
 
-    return jsonify({"rol": rol_nombre}), 201
+
+def _respuesta_bloqueo(segundos):
+    resp = app.make_response(
+        _respuesta_auth("Demasiados intentos fallidos. Intenta mas tarde", 429)
+    )
+    resp.headers["Retry-After"] = str(segundos)
+    return resp
 
 
 @app.route("/api/login", methods=["POST"])
 def login():
-    ip = request.remote_addr
-
-    with lock:
-        if failed_attempts.get(ip, 0) >= MAX_FAILED:
-            return _respuesta_auth(
-                "Demasiados intentos fallidos. Intenta mas tarde", 429
-            )
+    ip = request.remote_addr or "desconocida"
 
     if _es_formulario():
         mail = request.form.get("mail")
         clave = request.form.get("clave")
     else:
-        data = request.get_json(silent=True) or {}
+        data = request.get_json(silent=True)
+        data = data if isinstance(data, dict) else {}
         mail = data.get("mail")
         clave = data.get("clave")
 
-    if not mail or not clave:
+    if not isinstance(mail, str) or not isinstance(clave, str) or not mail or not clave:
+        return _respuesta_auth("Credenciales invalidas", 401)
+
+    mail = mail.strip().lower()
+    cuenta = "cuenta:" + mail
+
+    # Limite por IP y por cuenta, con bloqueo temporal progresivo.
+    espera = max(limite_ip.segundos_bloqueo(ip), limite_cuenta.segundos_bloqueo(cuenta))
+    if espera:
+        logger.warning("Login bloqueado: ip=%s cuenta=%s", ip, _enmascarar(mail))
+        return _respuesta_bloqueo(espera)
+
+    conn = get_db()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id, clave FROM Usuario WHERE mail = ?", (mail,))
+        row = cur.fetchone()
+    finally:
+        conn.close()
+
+    hash_guardado = row["clave"] if row else _HASH_FICTICIO
+    clave_valida = bcrypt.checkpw(clave.encode("utf-8"), hash_guardado.encode("utf-8"))
+
+    if row is None or not clave_valida:
+        b_ip = limite_ip.registrar_fallo(ip)
+        b_cuenta = limite_cuenta.registrar_fallo(cuenta)
+        # Se registra el intento fallido (RS-03) sin la clave ni el correo completo.
+        logger.warning("Login fallido: ip=%s cuenta=%s", ip, _enmascarar(mail))
+        if b_ip or b_cuenta:
+            logger.warning(
+                "Bloqueo temporal: ip=%s cuenta=%s duracion=%ss",
+                ip, _enmascarar(mail), max(b_ip, b_cuenta),
+            )
+        # Mensaje generico: no revela si el correo existe.
         return _respuesta_auth("Credenciales invalidas", 401, mail_form=mail)
+
+    limite_cuenta.limpiar(cuenta)
+
+    usuario = _usuario_por_id(row["id"])
+    _iniciar_sesion(usuario)
+    token = _emitir_token(usuario["id"])
+    logger.info("Auditoria: login_exitoso usuario_id=%s", usuario["id"])
+
+    if _es_formulario():
+        return redirect(url_for("dashboard"))
+    return jsonify({"token": token, "expira_en": TOKEN_TTL, "rol": usuario["rol"]}), 200
+
+
+@app.route("/api/cambiar-clave", methods=["POST"])
+def cambiar_clave():
+    """Cambia la clave y revoca TODAS las sesiones y tokens del usuario."""
+    usuario = _usuario_actual()
+    if not usuario:
+        return jsonify({"error": "Sesion requerida"}), 401
+
+    data, error = _leer_json_estricto(("clave_actual", "clave_nueva"))
+    if error:
+        return jsonify({"error": error}), 400
+
+    actual = data.get("clave_actual") or ""
+    nueva = data.get("clave_nueva") or ""
+    if not actual or not bcrypt.checkpw(actual.encode("utf-8"), usuario["clave"].encode("utf-8")):
+        _fallo("clave_actual_incorrecta", "clave_actual", "")
+        return jsonify({"error": "La clave actual es incorrecta"}), 400
+    error = _validar_clave_nueva(nueva)
+    if error:
+        return jsonify({"error": error}), 400
+
+    nuevo_hash = bcrypt.hashpw(nueva.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+    conn = get_db()
+    try:
+        conn.execute("UPDATE Usuario SET clave = ? WHERE id = ?", (nuevo_hash, usuario["id"]))
+        _revocar_todo(conn, usuario["id"])
+        conn.commit()
+    finally:
+        conn.close()
+
+    session.clear()
+    logger.info("Auditoria: cambio_clave usuario_id=%s sesiones_revocadas=si", usuario["id"])
+    return jsonify({"mensaje": "Clave actualizada. Inicia sesion nuevamente"}), 200
+
+
+def _enviar_correo(destino, asunto, cuerpo):
+    """Servicio de correo SIMULADO. En produccion se usaria SMTP o un proveedor."""
+    BUZON_SIMULADO.append({"para": destino, "asunto": asunto, "cuerpo": cuerpo})
+    del BUZON_SIMULADO[:-50]
+    logger.info("Correo enviado: destino=%s asunto=%s", _enmascarar(destino), asunto)
+
+
+@app.route("/api/recuperar", methods=["POST"])
+def solicitar_recuperacion():
+    """Genera un token de un solo uso y lo 'envia' por correo.
+
+    La respuesta es siempre la misma para no revelar si el correo existe.
+    """
+    data, error = _leer_json_estricto(("mail",))
+    if error:
+        return jsonify({"error": error}), 400
+    mail = (data.get("mail") or "").strip().lower()
+
+    respuesta = (
+        jsonify({"mensaje": "Si el correo esta registrado, recibiras un enlace de recuperacion"}),
+        200,
+    )
+    if not mail:
+        return respuesta
+
+    conn = get_db()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM Usuario WHERE mail = ?", (mail,))
+        row = cur.fetchone()
+        if row is None:
+            return respuesta
+
+        # Invalida los tokens anteriores antes de emitir uno nuevo.
+        cur.execute(
+            "UPDATE TokenRecuperacion SET usado = 1 WHERE usuario_id = ? AND usado = 0",
+            (row["id"],),
+        )
+        token = secrets.token_urlsafe(32)
+        cur.execute(
+            "INSERT INTO TokenRecuperacion (token_hash, usuario_id, expira_en) VALUES (?, ?, ?)",
+            (_hash_token(token), row["id"], _ahora() + RESET_TTL),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    _enviar_correo(
+        mail,
+        "Recuperacion de clave",
+        "Usa este codigo en /api/restablecer (expira en %d min): %s" % (RESET_TTL // 60, token),
+    )
+    # El evento se registra SIN el token.
+    logger.info("Auditoria: recuperacion_solicitada usuario_id=%s", row["id"])
+    return respuesta
+
+
+@app.route("/api/restablecer", methods=["POST"])
+def restablecer_clave():
+    """Consume un token de recuperacion valido (un solo uso, expiracion corta)."""
+    data, error = _leer_json_estricto(("token", "clave_nueva"))
+    if error:
+        return jsonify({"error": error}), 400
+    token = data.get("token") or ""
+    nueva = data.get("clave_nueva") or ""
 
     conn = get_db()
     try:
         cur = conn.cursor()
         cur.execute(
-            """
-            SELECT u.id, u.mail, u.clave, r.nombre AS rol_nombre
-            FROM Usuario u
-            JOIN Rol r ON u.rol_id = r.id
-            WHERE u.mail = ?
-            """,
-            (mail,),
+            "SELECT id, usuario_id, expira_en, usado FROM TokenRecuperacion WHERE token_hash = ?",
+            (_hash_token(token),),
         )
-        row = cur.fetchone()
+        fila = cur.fetchone()
+        if not token or fila is None or fila["usado"] or fila["expira_en"] <= _ahora():
+            _fallo("token_recuperacion_invalido", "token", "")
+            return jsonify({"error": "Token invalido o expirado"}), 400
+
+        error = _validar_clave_nueva(nueva)
+        if error:
+            return jsonify({"error": error}), 400
+
+        nuevo_hash = bcrypt.hashpw(nueva.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+        cur.execute("UPDATE Usuario SET clave = ? WHERE id = ?", (nuevo_hash, fila["usuario_id"]))
+        cur.execute(
+            "UPDATE TokenRecuperacion SET usado = 1 WHERE usuario_id = ?",
+            (fila["usuario_id"],),
+        )
+        _revocar_todo(conn, fila["usuario_id"])
+        conn.commit()
     finally:
         conn.close()
 
-    if row is None:
-        with lock:
-            failed_attempts[ip] = failed_attempts.get(ip, 0) + 1
-        return _respuesta_auth("Credenciales invalidas", 401, mail_form=mail)
-
-    clave_valida = bcrypt.checkpw(
-        clave.encode("utf-8"), row["clave"].encode("utf-8")
-    )
-
-    if not clave_valida:
-        with lock:
-            failed_attempts[ip] = failed_attempts.get(ip, 0) + 1
-        return _respuesta_auth("Credenciales invalidas", 401, mail_form=mail)
-
-    with lock:
-        failed_attempts[ip] = 0
-
-    token = secrets.token_hex(32)
-
     session.clear()
-    session["mail"] = row["mail"]
-    session["rol"] = row["rol_nombre"]
-    session["user_id"] = row["id"]
+    logger.info("Auditoria: clave_restablecida usuario_id=%s", fila["usuario_id"])
+    return jsonify({"mensaje": "Clave restablecida. Inicia sesion nuevamente"}), 200
 
-    if _es_formulario():
-        return redirect(url_for("dashboard"))
 
-    return jsonify({"token": token, "rol": row["rol_nombre"]}), 200
+# ---------------------------------------------------------------------------
+# Administracion de roles
+# ---------------------------------------------------------------------------
+
+@app.route("/api/usuarios/<int:usuario_id>/rol", methods=["PUT"])
+def cambiar_rol(usuario_id):
+    """Solo el Administrador puede asignar roles."""
+    usuario = _usuario_actual()
+    if not usuario:
+        return jsonify({"error": "Sesion requerida"}), 401
+    if usuario["rol_id"] != ROL_ADMIN:
+        _fallo("autorizacion", "rol", "")
+        return jsonify({"error": "Solo un administrador puede cambiar roles"}), 403
+
+    data, error = _leer_json_estricto(("rol",))
+    if error:
+        return jsonify({"error": error}), 400
+    rol_id = ROLES_POR_NOMBRE.get((data.get("rol") or "").strip().lower())
+    if rol_id is None:
+        return jsonify({"error": "Rol invalido. Usa: Administrador, Docente o Estudiante"}), 400
+
+    conn = get_db()
+    try:
+        cur = conn.cursor()
+        cur.execute("UPDATE Usuario SET rol_id = ? WHERE id = ?", (rol_id, usuario_id))
+        conn.commit()
+        if cur.rowcount == 0:
+            return jsonify({"error": "Usuario no encontrado"}), 404
+    finally:
+        conn.close()
+
+    logger.info(
+        "Auditoria: cambio_rol usuario_id=%s nuevo_rol=%s por=%s",
+        usuario_id, ROLES[rol_id], usuario["id"],
+    )
+    return jsonify({"id": usuario_id, "rol": ROLES[rol_id]}), 200
+
+
+def _promover_desde_consola(mail, nombre_rol):
+    """Uso: python app_auth_db.py promover <mail> <Administrador|Docente|Estudiante>"""
+    rol_id = ROLES_POR_NOMBRE.get(nombre_rol.lower())
+    if rol_id is None:
+        print("Rol invalido. Usa: Administrador, Docente o Estudiante")
+        return 1
+    init_db()
+    conn = get_db()
+    try:
+        cur = conn.cursor()
+        cur.execute("UPDATE Usuario SET rol_id = ? WHERE mail = ?", (rol_id, mail.strip().lower()))
+        conn.commit()
+        if cur.rowcount == 0:
+            print("No existe un usuario con ese correo")
+            return 1
+    finally:
+        conn.close()
+    print("%s ahora es %s" % (mail, ROLES[rol_id]))
+    return 0
 
 
 if __name__ == "__main__":
+    if len(sys.argv) == 4 and sys.argv[1] == "promover":
+        sys.exit(_promover_desde_consola(sys.argv[2], sys.argv[3]))
     init_db()
     app.run(host="127.0.0.1", port=5000, debug=True)

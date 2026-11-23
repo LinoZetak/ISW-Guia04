@@ -1,21 +1,40 @@
+import os
+import tempfile
 import unittest
+
+import app_auth_db
 from app_auth_db import app, init_db
 
 
 class TestEjercicioPropuesto31(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        # Base de datos temporal: las pruebas no tocan auth.db real.
+        cls._tmp = tempfile.TemporaryDirectory()
+        cls._db_original = app_auth_db.DB_PATH
+        app_auth_db.DB_PATH = os.path.join(cls._tmp.name, "test_3_1.db")
         init_db()
+        app.config["TESTING"] = True
+        app.test_client().post(
+            "/api/registro",
+            json={"mail": "tester@unsaac.edu.pe", "clave": "Tester2026"},
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        app_auth_db.DB_PATH = cls._db_original
+        cls._tmp.cleanup()
 
     def setUp(self):
         app.config["TESTING"] = True
         self.client = app.test_client()
 
     def _autenticar(self):
-        with self.client.session_transaction() as sess:
-            sess["user_id"] = 1
-            sess["mail"] = "tester@unsaac.edu.pe"
-            sess["rol"] = "User"
+        resp = self.client.post(
+            "/api/login",
+            json={"mail": "tester@unsaac.edu.pe", "clave": "Tester2026"},
+        )
+        self.assertEqual(resp.status_code, 200)
 
     def test_01_sin_autenticacion_rechazada(self):
         resp = self.client.post(
